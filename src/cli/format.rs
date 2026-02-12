@@ -3,6 +3,7 @@ use crate::rules::Violation;
 use crate::scan::ScanResult;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// Print violations grouped by file with ANSI colors.
 pub fn print_pretty(result: &ScanResult) {
@@ -11,6 +12,7 @@ pub fn print_pretty(result: &ScanResult) {
             "\x1b[32m✓\x1b[0m No violations found ({} files scanned, {} rules loaded)",
             result.files_scanned, result.rules_loaded
         );
+        print_ratchet_summary(&result.ratchet_counts);
         return;
     }
 
@@ -78,6 +80,27 @@ pub fn print_pretty(result: &ScanResult) {
         " ({} files scanned, {} rules loaded)\x1b[0m",
         result.files_scanned, result.rules_loaded
     );
+
+    print_ratchet_summary(&result.ratchet_counts);
+}
+
+fn print_ratchet_summary(ratchet_counts: &HashMap<String, (usize, usize)>) {
+    if ratchet_counts.is_empty() {
+        return;
+    }
+
+    println!("\n\x1b[1mRatchet rules:\x1b[0m");
+    let mut sorted: Vec<_> = ratchet_counts.iter().collect();
+    sorted.sort_by_key(|(id, _)| (*id).clone());
+
+    for (rule_id, &(found, max)) in &sorted {
+        let status = if found <= max {
+            format!("\x1b[32m✓ pass\x1b[0m ({}/{})", found, max)
+        } else {
+            format!("\x1b[31m✗ OVER\x1b[0m ({}/{})", found, max)
+        };
+        println!("  {:<30} {}", rule_id, status);
+    }
 }
 
 /// Print violations as structured JSON.
@@ -102,6 +125,17 @@ pub fn print_json(result: &ScanResult) {
         })
         .collect();
 
+    let ratchet: serde_json::Map<String, serde_json::Value> = result
+        .ratchet_counts
+        .iter()
+        .map(|(id, &(found, max))| {
+            (
+                id.clone(),
+                json!({ "found": found, "max": max, "pass": found <= max }),
+            )
+        })
+        .collect();
+
     let output = json!({
         "violations": violations,
         "summary": {
@@ -110,7 +144,8 @@ pub fn print_json(result: &ScanResult) {
             "warnings": result.violations.iter().filter(|v| v.severity == Severity::Warning).count(),
             "files_scanned": result.files_scanned,
             "rules_loaded": result.rules_loaded,
-        }
+        },
+        "ratchet": ratchet,
     });
 
     println!("{}", serde_json::to_string_pretty(&output).unwrap());

@@ -1,4 +1,8 @@
 use crate::config::RuleConfig;
+use crate::rules::banned_dependency::BannedDependencyRule;
+use crate::rules::banned_import::BannedImportRule;
+use crate::rules::banned_pattern::BannedPatternRule;
+use crate::rules::ratchet::RatchetRule;
 use crate::rules::tailwind_dark_mode::TailwindDarkModeRule;
 use crate::rules::tailwind_theme_tokens::TailwindThemeTokensRule;
 use crate::rules::{Rule, RuleBuildError};
@@ -32,6 +36,10 @@ pub fn build_rule(rule_type: &str, config: &RuleConfig) -> Result<Box<dyn Rule>,
     match rule_type {
         "tailwind-dark-mode" => Ok(Box::new(TailwindDarkModeRule::new(config)?)),
         "tailwind-theme-tokens" => Ok(Box::new(TailwindThemeTokensRule::new(config)?)),
+        "ratchet" => Ok(Box::new(RatchetRule::new(config)?)),
+        "banned-pattern" => Ok(Box::new(BannedPatternRule::new(config)?)),
+        "banned-import" => Ok(Box::new(BannedImportRule::new(config)?)),
+        "banned-dependency" => Ok(Box::new(BannedDependencyRule::new(config)?)),
         _ => Err(FactoryError::UnknownRuleType(rule_type.to_string())),
     }
 }

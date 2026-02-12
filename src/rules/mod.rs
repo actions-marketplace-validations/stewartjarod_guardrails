@@ -1,4 +1,8 @@
+pub mod banned_dependency;
+pub mod banned_import;
+pub mod banned_pattern;
 pub mod factory;
+pub mod ratchet;
 pub mod tailwind_dark_mode;
 pub mod tailwind_theme_tokens;
 
@@ -43,6 +47,7 @@ pub struct Violation {
 #[derive(Debug)]
 pub enum RuleBuildError {
     InvalidRegex(String, regex::Error),
+    MissingField(String, &'static str),
 }
 
 impl std::fmt::Display for RuleBuildError {
@@ -50,6 +55,9 @@ impl std::fmt::Display for RuleBuildError {
         match self {
             RuleBuildError::InvalidRegex(id, err) => {
                 write!(f, "rule '{}': invalid regex: {}", id, err)
+            }
+            RuleBuildError::MissingField(id, field) => {
+                write!(f, "rule '{}': missing required field '{}'", id, field)
             }
         }
     }

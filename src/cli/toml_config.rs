@@ -36,6 +36,13 @@ pub struct TomlRule {
     pub allowed_classes: Vec<String>,
     #[serde(default)]
     pub token_map: Vec<String>,
+    pub pattern: Option<String>,
+    pub max_count: Option<usize>,
+    #[serde(default)]
+    pub packages: Vec<String>,
+    #[serde(default)]
+    pub regex: bool,
+    pub manifest: Option<String>,
 }
 
 fn default_severity() -> String {
@@ -58,6 +65,11 @@ impl TomlRule {
             glob: self.glob.clone(),
             allowed_classes: self.allowed_classes.clone(),
             token_map: self.token_map.clone(),
+            pattern: self.pattern.clone(),
+            max_count: self.max_count,
+            packages: self.packages.clone(),
+            regex: self.regex,
+            manifest: self.manifest.clone(),
         }
     }
 }
