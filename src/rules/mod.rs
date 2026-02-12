@@ -1,3 +1,4 @@
+pub mod factory;
 pub mod tailwind_dark_mode;
 pub mod tailwind_theme_tokens;
 

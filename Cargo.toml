@@ -6,3 +6,9 @@ description = "Enforce architectural decisions AI coding tools keep ignoring"
 
 [dependencies]
 regex = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+walkdir = "2"
+globset = "0.4"
+serde_json = "1"
