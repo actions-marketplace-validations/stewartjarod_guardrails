@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/guardrails.png" alt="Guardrails logo" width="300" />
+  <img src="assets/guardrails-logo.png" alt="Guardrails logo" width="300" />
 </p>
 
 # guardrails
