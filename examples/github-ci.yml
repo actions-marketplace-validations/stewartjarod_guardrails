@@ -1,0 +1,28 @@
+# Example: Guardrails CI workflow for GitHub Actions
+# Copy this file to .github/workflows/guardrails.yml in your project.
+#
+# On pull requests, only files changed in the PR are scanned.
+# On pushes to main, all files are scanned.
+
+name: Guardrails
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history needed for diff-aware scanning
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: AstroGuard/guardrails@main
+        with:
+          paths: 'src'
+          # changed-only defaults to "auto" (enabled on PRs, disabled on push)
+          # base: 'main'  # Override the base branch for diff comparison

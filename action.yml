@@ -13,6 +13,13 @@ inputs:
     description: 'Paths to scan (space-separated)'
     required: false
     default: '.'
+  changed-only:
+    description: 'Only scan changed files. "auto" enables on PRs, "true"/"false" to force.'
+    required: false
+    default: 'auto'
+  base:
+    description: 'Base ref for changed-only diff (default: auto-detect from GITHUB_BASE_REF)'
+    required: false
   fail-on-warning:
     description: 'Fail the check if warnings are found'
     required: false
@@ -21,6 +28,14 @@ inputs:
     description: 'Version of guardrails to install'
     required: false
     default: 'latest'
+
+outputs:
+  errors:
+    description: 'Number of errors found'
+    value: ${{ steps.scan.outputs.errors }}
+  exit-code:
+    description: 'Exit code from the scan (0 = clean, 1 = violations)'
+    value: ${{ steps.scan.outputs.exit_code }}
 
 runs:
   using: 'composite'
@@ -34,9 +49,39 @@ runs:
           cargo install guardrails@${{ inputs.version }}
         fi
 
-    - name: Run Guardrails
+    - name: Run Guardrails scan
+      id: scan
       shell: bash
       run: |
+        # Determine if we should use --changed-only
+        CHANGED_FLAG=""
+        if [ "${{ inputs.changed-only }}" = "true" ]; then
+          CHANGED_FLAG="--changed-only"
+        elif [ "${{ inputs.changed-only }}" = "auto" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+          CHANGED_FLAG="--changed-only"
+        fi
+
+        BASE_FLAG=""
+        if [ -n "${{ inputs.base }}" ] && [ -n "$CHANGED_FLAG" ]; then
+          BASE_FLAG="--base ${{ inputs.base }}"
+        fi
+
+        # Run with github format for inline annotations
+        set +e
         guardrails scan ${{ inputs.paths }} \
           --config ${{ inputs.config }} \
-          --format github
+          --format github \
+          $CHANGED_FLAG $BASE_FLAG
+        SCAN_EXIT=$?
+        set -e
+
+        # Count errors from output
+        echo "exit_code=$SCAN_EXIT" >> "$GITHUB_OUTPUT"
+
+        # Run again with markdown for step summary
+        guardrails scan ${{ inputs.paths }} \
+          --config ${{ inputs.config }} \
+          --format markdown \
+          $CHANGED_FLAG $BASE_FLAG >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+        exit $SCAN_EXIT
