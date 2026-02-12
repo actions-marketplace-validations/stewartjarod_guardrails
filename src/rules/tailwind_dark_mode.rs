@@ -24,6 +24,10 @@ pub struct TailwindDarkModeRule {
     class_attr_re: Regex,
     /// Regex to identify color utility classes.
     color_utility_re: Regex,
+    /// Regex to find cn/clsx/classNames/cva/twMerge function calls.
+    cn_fn_re: Regex,
+    /// Regex to extract quoted strings inside function calls.
+    cn_str_re: Regex,
 }
 
 /// The Tailwind color utility prefixes that are theme-sensitive.
@@ -112,6 +116,11 @@ impl TailwindDarkModeRule {
         let color_utility_re = Regex::new(&color_re_str)
             .map_err(|e| RuleBuildError::InvalidRegex(config.id.clone(), e))?;
 
+        let cn_fn_re = Regex::new(r#"(?:cn|clsx|classNames|cva|twMerge)\s*\("#)
+            .map_err(|e| RuleBuildError::InvalidRegex(config.id.clone(), e))?;
+        let cn_str_re = Regex::new(r#"['"`]([^'"`]+?)['"`]"#)
+            .map_err(|e| RuleBuildError::InvalidRegex(config.id.clone(), e))?;
+
         let default_glob = "**/*.{tsx,jsx,html}".to_string();
 
         Ok(Self {
@@ -123,6 +132,8 @@ impl TailwindDarkModeRule {
             allowed,
             class_attr_re,
             color_utility_re,
+            cn_fn_re,
+            cn_str_re,
         })
     }
 
@@ -244,7 +255,7 @@ impl Rule for TailwindDarkModeRule {
             // Also check for multi-word strings that look like class lists in
             // cn(), clsx(), classNames() calls — common in shadcn projects.
             // We do a broader scan for quoted strings inside these function calls.
-            let extra_strings = extract_cn_strings(line);
+            let extra_strings = self.extract_cn_strings(line);
 
             for class_str in class_strings.iter().copied().chain(extra_strings.iter().map(|s| s.as_str())) {
                 let missing = self.find_missing_dark_variants(class_str);
@@ -284,28 +295,26 @@ impl Rule for TailwindDarkModeRule {
     }
 }
 
-/// Extract string arguments from cn(), clsx(), classNames() calls.
-fn extract_cn_strings(line: &str) -> Vec<String> {
-    let mut results = Vec::new();
+impl TailwindDarkModeRule {
+    /// Extract string arguments from cn(), clsx(), classNames() calls.
+    fn extract_cn_strings(&self, line: &str) -> Vec<String> {
+        let mut results = Vec::new();
 
-    // Simple pattern: find cn(, clsx(, classNames( and extract quoted strings within
-    let fn_re = regex::Regex::new(r#"(?:cn|clsx|classNames|cva|twMerge)\s*\("#).unwrap();
-    let str_re = regex::Regex::new(r#"['"`]([^'"`]+?)['"`]"#).unwrap();
-
-    if let Some(fn_match) = fn_re.find(line) {
-        let remainder = &line[fn_match.end()..];
-        for cap in str_re.captures_iter(remainder) {
-            if let Some(m) = cap.get(1) {
-                let s = m.as_str();
-                // Only include if it looks like Tailwind classes (has spaces or dashes)
-                if s.contains('-') || s.contains(' ') {
-                    results.push(s.to_string());
+        if let Some(fn_match) = self.cn_fn_re.find(line) {
+            let remainder = &line[fn_match.end()..];
+            for cap in self.cn_str_re.captures_iter(remainder) {
+                if let Some(m) = cap.get(1) {
+                    let s = m.as_str();
+                    // Only include if it looks like Tailwind classes (has spaces or dashes)
+                    if s.contains('-') || s.contains(' ') {
+                        results.push(s.to_string());
+                    }
                 }
             }
         }
-    }
 
-    results
+        results
+    }
 }
 
 /// Suggest a dark mode counterpart for a color class.

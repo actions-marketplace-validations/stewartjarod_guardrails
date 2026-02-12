@@ -3,12 +3,12 @@ use crate::presets::{self, PresetError};
 use crate::rules::factory::{self, FactoryError};
 use crate::rules::{Rule, ScanContext, Violation};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 #[derive(Debug)]
 pub enum ScanError {
@@ -112,6 +112,26 @@ pub fn run_scan(config_path: &Path, target_paths: &[PathBuf]) -> Result<ScanResu
     let mut files_scanned = 0;
 
     for file_path in &files {
+        let file_str = file_path.to_string_lossy();
+        let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
+
+        // Pre-check: does ANY rule match this file? If not, skip the read entirely.
+        let matching_rules: Vec<usize> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rule_glob))| {
+                match rule_glob {
+                    Some(gs) => gs.is_match(&*file_str) || gs.is_match(&*file_name),
+                    None => true, // no glob = matches all files
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if matching_rules.is_empty() {
+            continue;
+        }
+
         let content = match fs::read_to_string(file_path) {
             Ok(c) => c,
             Err(_) => continue, // skip binary/unreadable files
@@ -123,17 +143,8 @@ pub fn run_scan(config_path: &Path, target_paths: &[PathBuf]) -> Result<ScanResu
             content: &content,
         };
 
-        for (rule, rule_glob) in &rules {
-            // Apply per-rule glob filter
-            if let Some(ref gs) = rule_glob {
-                let file_str = file_path.to_string_lossy();
-                let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
-                if !gs.is_match(&*file_str) && !gs.is_match(&*file_name) {
-                    continue;
-                }
-            }
-
-            let mut file_violations = rule.check_file(&ctx);
+        for i in &matching_rules {
+            let mut file_violations = rules[*i].0.check_file(&ctx);
             violations.append(&mut file_violations);
         }
     }
@@ -280,8 +291,17 @@ fn collect_files(target_paths: &[PathBuf], exclude_set: &GlobSet) -> Vec<PathBuf
         if target.is_file() {
             files.push(target.clone());
         } else {
-            for entry in WalkDir::new(target).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file() {
+            // Use the `ignore` crate to automatically respect .gitignore,
+            // .ignore, and skip hidden files/directories (.git, etc.).
+            let walker = WalkBuilder::new(target)
+                .hidden(true) // skip hidden files/dirs like .git
+                .git_ignore(true) // respect .gitignore
+                .git_global(true) // respect global gitignore
+                .git_exclude(true) // respect .git/info/exclude
+                .build();
+
+            for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().map_or(false, |ft| ft.is_file()) {
                     let path = entry.into_path();
                     let rel = path.strip_prefix(target).unwrap_or(&path);
                     if exclude_set.is_match(rel.to_string_lossy().as_ref()) {
