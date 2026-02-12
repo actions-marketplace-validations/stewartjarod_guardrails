@@ -13,7 +13,7 @@ use crate::config::Severity;
 use std::path::{Path, PathBuf};
 
 /// A lint rule that checks source files for violations.
-pub trait Rule {
+pub trait Rule: Send + Sync {
     /// Unique identifier for this rule (e.g. `"tailwind-dark-mode"`).
     fn id(&self) -> &str;
 

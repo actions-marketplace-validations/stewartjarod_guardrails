@@ -6,11 +6,14 @@ use crate::rules::file_presence::FilePresenceRule;
 use crate::rules::{Rule, ScanContext, Violation};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// A plugin config file containing additional rules.
 #[derive(Debug, serde::Deserialize)]
@@ -69,29 +72,48 @@ pub struct BaselineResult {
     pub files_scanned: usize,
 }
 
-/// A fully-built rule with all its compiled metadata.
-/// This avoids index-mismatch bugs by keeping conditioning data
-/// alongside the rule rather than looking it up by index.
-struct BuiltRule {
-    rule: Box<dyn Rule>,
+/// A group of rules that share the same glob patterns.
+/// Glob matching is done once per group, amortizing the cost when
+/// multiple rules use the same inclusion/exclusion patterns.
+struct RuleGroup {
     inclusion_glob: Option<GlobSet>,
     exclusion_glob: Option<GlobSet>,
+    rules: Vec<RuleWithConditioning>,
+}
+
+/// A single rule with its conditioning data and pre-computed suppression strings.
+struct RuleWithConditioning {
+    rule: Box<dyn Rule>,
     file_contains: Option<String>,
     file_not_contains: Option<String>,
+    /// Pre-computed `"guardrails:allow-{rule_id}"` string.
+    allow_marker: String,
+    /// Pre-computed `"guardrails:allow-next-line {rule_id}"` string.
+    allow_next_line: String,
 }
 
 /// Result of building rules from config.
 struct BuiltRules {
-    rules: Vec<BuiltRule>,
+    rule_groups: Vec<RuleGroup>,
     ratchet_thresholds: HashMap<String, usize>,
     file_presence_rules: Vec<FilePresenceRule>,
 }
 
 /// Build rules from resolved TOML rules. Shared by run_scan and run_scan_stdin.
 fn build_rules(resolved_rules: &[TomlRule]) -> Result<BuiltRules, ScanError> {
-    let mut rules: Vec<BuiltRule> = Vec::new();
     let mut ratchet_thresholds: HashMap<String, usize> = HashMap::new();
     let mut file_presence_rules: Vec<FilePresenceRule> = Vec::new();
+
+    // Intermediate representation before grouping
+    struct IntermediateRule {
+        rule: Box<dyn Rule>,
+        inclusion_pattern: Option<String>,
+        exclusion_patterns: Vec<String>,
+        file_contains: Option<String>,
+        file_not_contains: Option<String>,
+    }
+
+    let mut intermediates: Vec<IntermediateRule> = Vec::new();
 
     for toml_rule in resolved_rules {
         let rule_config = toml_rule.to_rule_config();
@@ -113,46 +135,83 @@ fn build_rules(resolved_rules: &[TomlRule]) -> Result<BuiltRules, ScanError> {
             }
         }
 
-        // Build per-rule inclusion glob (with brace expansion)
-        let inclusion_glob = if let Some(ref pattern) = rule.file_glob() {
-            Some(build_glob_set_from_pattern(pattern)?)
-        } else {
-            None
-        };
+        let inclusion_pattern = rule.file_glob().map(|s| s.to_string());
+        let exclusion_patterns = toml_rule.exclude_glob.clone();
 
-        // Build per-rule exclusion glob
-        let exclusion_glob = if !toml_rule.exclude_glob.is_empty() {
-            Some(build_glob_set(&toml_rule.exclude_glob)?)
-        } else {
-            None
-        };
-
-        rules.push(BuiltRule {
+        intermediates.push(IntermediateRule {
             rule,
-            inclusion_glob,
-            exclusion_glob,
+            inclusion_pattern,
+            exclusion_patterns,
             file_contains: toml_rule.file_contains.clone(),
             file_not_contains: toml_rule.file_not_contains.clone(),
         });
     }
 
+    // Group rules by (inclusion_pattern, exclusion_patterns) to avoid redundant glob matching.
+    let mut groups: Vec<((Option<String>, Vec<String>), Vec<IntermediateRule>)> = Vec::new();
+
+    for ir in intermediates {
+        let key = (ir.inclusion_pattern.clone(), ir.exclusion_patterns.clone());
+        if let Some(group) = groups.iter_mut().find(|(k, _)| *k == key) {
+            group.1.push(ir);
+        } else {
+            groups.push((key, vec![ir]));
+        }
+    }
+
+    // Build RuleGroups with compiled GlobSets (once per unique pattern)
+    let mut rule_groups: Vec<RuleGroup> = Vec::new();
+    for ((inc_pattern, exc_patterns), intermediates) in groups {
+        let inclusion_glob = if let Some(ref pattern) = inc_pattern {
+            Some(build_glob_set_from_pattern(pattern)?)
+        } else {
+            None
+        };
+
+        let exclusion_glob = if !exc_patterns.is_empty() {
+            Some(build_glob_set(&exc_patterns)?)
+        } else {
+            None
+        };
+
+        let rules = intermediates
+            .into_iter()
+            .map(|ir| {
+                let id = ir.rule.id().to_string();
+                RuleWithConditioning {
+                    rule: ir.rule,
+                    file_contains: ir.file_contains,
+                    file_not_contains: ir.file_not_contains,
+                    allow_marker: format!("guardrails:allow-{}", id),
+                    allow_next_line: format!("guardrails:allow-next-line {}", id),
+                }
+            })
+            .collect();
+
+        rule_groups.push(RuleGroup {
+            inclusion_glob,
+            exclusion_glob,
+            rules,
+        });
+    }
+
     Ok(BuiltRules {
-        rules,
+        rule_groups,
         ratchet_thresholds,
         file_presence_rules,
     })
 }
 
-/// Check if a rule matches a file path (inclusion + exclusion globs).
-fn rule_matches_file(built: &BuiltRule, file_str: &str, file_name: &str) -> bool {
-    let included = match &built.inclusion_glob {
+/// Check if a rule group matches a file path (inclusion + exclusion globs).
+fn group_matches_file(group: &RuleGroup, file_str: &str, file_name: &str) -> bool {
+    let included = match &group.inclusion_glob {
         Some(gs) => gs.is_match(file_str) || gs.is_match(file_name),
         None => true,
     };
     if !included {
         return false;
     }
-    if let Some(ref exc) = built.exclusion_glob {
+    if let Some(ref exc) = group.exclusion_glob {
         if exc.is_match(file_str) || exc.is_match(file_name) {
             return false;
         }
@@ -160,15 +219,25 @@ fn rule_matches_file(built: &BuiltRule, file_str: &str, file_name: &str) -> bool
     true
 }
 
-/// Check file-context conditioning (file_contains / file_not_contains).
-fn passes_file_conditioning(built: &BuiltRule, content: &str) -> bool {
-    if let Some(ref needle) = built.file_contains {
-        if !content.contains(needle.as_str()) {
+/// Check file-context conditioning (file_contains / file_not_contains) with caching.
+fn passes_file_conditioning_cached<'a>(
+    rule: &'a RuleWithConditioning,
+    content: &str,
+    cache: &mut HashMap<&'a str, bool>,
+) -> bool {
+    if let Some(ref needle) = rule.file_contains {
+        let &mut result = cache
+            .entry(needle.as_str())
+            .or_insert_with(|| content.contains(needle.as_str()));
+        if !result {
             return false;
         }
     }
-    if let Some(ref needle) = built.file_not_contains {
-        if content.contains(needle.as_str()) {
+    if let Some(ref needle) = rule.file_not_contains {
+        let &mut result = cache
+            .entry(needle.as_str())
+            .or_insert_with(|| content.contains(needle.as_str()));
+        if result {
             return false;
         }
     }
@@ -177,7 +246,7 @@ fn passes_file_conditioning(built: &BuiltRule, content: &str) -> bool {
 
 /// Run rules against content and collect violations, filtering escape-hatch comments.
 fn run_rules_on_content(
-    built_rules: &[BuiltRule],
+    rule_groups: &[RuleGroup],
     file_path: &Path,
     content: &str,
     file_str: &str,
@@ -189,23 +258,32 @@ fn run_rules_on_content(
         file_path,
         content,
     };
+    let mut conditioning_cache: HashMap<&str, bool> = HashMap::new();
 
-    for built in built_rules {
-        if !rule_matches_file(built, file_str, file_name) {
-            continue;
-        }
-        if !passes_file_conditioning(built, content) {
+    for group in rule_groups {
+        if !group_matches_file(group, file_str, file_name) {
             continue;
         }
 
-        let file_violations = built.rule.check_file(&ctx);
-        for v in file_violations {
-            if let Some(line_num) = v.line {
-                if is_suppressed(&content_lines, line_num, &v.rule_id) {
-                    continue;
-                }
+        for rule_cond in &group.rules {
+            if !passes_file_conditioning_cached(rule_cond, content, &mut conditioning_cache) {
+                continue;
             }
-            violations.push(v);
+
+            let file_violations = rule_cond.rule.check_file(&ctx);
+            for v in file_violations {
+                if let Some(line_num) = v.line {
+                    if is_suppressed(
+                        &content_lines,
+                        line_num,
+                        &rule_cond.allow_marker,
+                        &rule_cond.allow_next_line,
+                    ) {
+                        continue;
+                    }
+                }
+                violations.push(v);
+            }
         }
     }
 
@@ -242,35 +320,47 @@ pub fn run_scan(config_path: &Path, target_paths: &[PathBuf]) -> Result<ScanResu
 
     // 5. Build rules via factory
     let built = build_rules(&resolved_rules)?;
-    let rules_loaded = built.rules.len();
+    let rules_loaded: usize = built.rule_groups.iter().map(|g| g.rules.len()).sum();
 
     // 6. Walk target paths and collect files
     let files = collect_files(target_paths, &exclude_set);
 
-    // 7. Run rules on each file
-    let mut violations: Vec<Violation> = Vec::new();
-    let mut files_scanned = 0;
+    // 7. Run rules on each file (parallel)
+    let files_scanned = AtomicUsize::new(0);
 
-    for file_path in &files {
-        let file_str = file_path.to_string_lossy();
-        let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
+    let mut violations: Vec<Violation> = files
+        .par_iter()
+        .filter_map(|file_path| {
+            let file_str = file_path.to_string_lossy();
+            let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
 
-        // Pre-check: does ANY rule match this file? If not, skip the read entirely.
-        let any_match = built.rules.iter().any(|r| rule_matches_file(r, &file_str, &file_name));
-        if !any_match {
-            continue;
-        }
+            // Pre-check: does ANY rule group match this file? If not, skip the read entirely.
+            let any_match = built
+                .rule_groups
+                .iter()
+                .any(|g| group_matches_file(g, &file_str, &file_name));
+            if !any_match {
+                return None;
+            }
 
-        let content = match fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue, // skip binary/unreadable files
-        };
+            let content = fs::read_to_string(file_path).ok()?;
 
-        files_scanned += 1;
-        let mut file_violations =
-            run_rules_on_content(&built.rules, file_path, &content, &file_str, &file_name);
-        violations.append(&mut file_violations);
-    }
+            files_scanned.fetch_add(1, Ordering::Relaxed);
+            let file_violations = run_rules_on_content(
+                &built.rule_groups,
+                file_path,
+                &content,
+                &file_str,
+                &file_name,
+            );
+            if file_violations.is_empty() {
+                None
+            } else {
+                Some(file_violations)
+            }
+        })
+        .flatten()
+        .collect();
 
     // 8. Run file-presence checks
     for fp_rule in &built.file_presence_rules {
@@ -283,7 +373,7 @@ pub fn run_scan(config_path: &Path, target_paths: &[PathBuf]) -> Result<ScanResu
 
     Ok(ScanResult {
         violations,
-        files_scanned,
+        files_scanned: files_scanned.load(Ordering::Relaxed),
         rules_loaded,
         ratchet_counts,
         changed_files_count: None,
@@ -344,14 +434,14 @@ pub fn run_scan_stdin(
     .map_err(ScanError::Preset)?;
 
     let built = build_rules(&resolved_rules)?;
-    let rules_loaded = built.rules.len();
+    let rules_loaded: usize = built.rule_groups.iter().map(|g| g.rules.len()).sum();
 
     let file_path = PathBuf::from(filename);
     let file_str = file_path.to_string_lossy();
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
 
     let violations =
-        run_rules_on_content(&built.rules, &file_path, content, &file_str, &file_name);
+        run_rules_on_content(&built.rule_groups, &file_path, content, &file_str, &file_name);
 
     let mut violations = violations;
     let ratchet_counts = apply_ratchet_thresholds(&mut violations, &built.ratchet_thresholds);
@@ -447,34 +537,50 @@ pub fn run_baseline(
 
     let files = collect_files(target_paths, &exclude_set);
 
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut files_scanned = 0;
+    let files_scanned = AtomicUsize::new(0);
 
-    for file_path in &files {
-        let content = match fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    let counts: HashMap<String, usize> = files
+        .par_iter()
+        .filter_map(|file_path| {
+            let content = fs::read_to_string(file_path).ok()?;
 
-        files_scanned += 1;
-        let ctx = ScanContext {
-            file_path,
-            content: &content,
-        };
+            files_scanned.fetch_add(1, Ordering::Relaxed);
+            let ctx = ScanContext {
+                file_path,
+                content: &content,
+            };
 
-        for (rule, rule_glob, _) in &rules {
-            if let Some(ref gs) = rule_glob {
-                let file_str = file_path.to_string_lossy();
-                let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
-                if !gs.is_match(&*file_str) && !gs.is_match(&*file_name) {
-                    continue;
+            let mut local_counts: HashMap<String, usize> = HashMap::new();
+            for (rule, rule_glob, _) in &rules {
+                if let Some(ref gs) = rule_glob {
+                    let file_str = file_path.to_string_lossy();
+                    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
+                    if !gs.is_match(&*file_str) && !gs.is_match(&*file_name) {
+                        continue;
+                    }
+                }
+
+                let violations = rule.check_file(&ctx);
+                if !violations.is_empty() {
+                    *local_counts.entry(rule.id().to_string()).or_insert(0) += violations.len();
                 }
             }
 
-            let violations = rule.check_file(&ctx);
-            *counts.entry(rule.id().to_string()).or_insert(0) += violations.len();
-        }
-    }
+            if local_counts.is_empty() {
+                None
+            } else {
+                Some(local_counts)
+            }
+        })
+        .reduce(
+            || HashMap::new(),
+            |mut acc, local| {
+                for (k, v) in local {
+                    *acc.entry(k).or_insert(0) += v;
+                }
+                acc
+            },
+        );
 
     let entries: Vec<BaselineEntry> = rules
         .iter()
@@ -487,20 +593,19 @@ pub fn run_baseline(
 
     Ok(BaselineResult {
         entries,
-        files_scanned,
+        files_scanned: files_scanned.load(Ordering::Relaxed),
     })
 }
 
 /// Check if a violation is suppressed by an escape-hatch comment.
-/// Looks for `guardrails:allow-{rule_id}` on the same line or the line before.
-fn is_suppressed(lines: &[&str], line_num: usize, rule_id: &str) -> bool {
-    let allow_marker = format!("guardrails:allow-{}", rule_id);
+/// Uses pre-computed marker strings to avoid per-call allocations.
+fn is_suppressed(lines: &[&str], line_num: usize, allow_marker: &str, allow_next_line: &str) -> bool {
     let allow_all = "guardrails:allow-all";
 
     // Check current line (1-indexed)
     if line_num > 0 && line_num <= lines.len() {
         let line = lines[line_num - 1];
-        if line.contains(&allow_marker) || line.contains(allow_all) {
+        if line.contains(allow_marker) || line.contains(allow_all) {
             return true;
         }
     }
@@ -508,8 +613,7 @@ fn is_suppressed(lines: &[&str], line_num: usize, rule_id: &str) -> bool {
     // Check previous line (next-line style: `// guardrails:allow-next-line`)
     if line_num >= 2 && line_num <= lines.len() {
         let prev = lines[line_num - 2];
-        let allow_next = format!("guardrails:allow-next-line {}", rule_id);
-        if prev.contains(&allow_next)
+        if prev.contains(allow_next_line)
             || prev.contains("guardrails:allow-next-line all")
         {
             return true;
@@ -525,25 +629,32 @@ fn collect_files(target_paths: &[PathBuf], exclude_set: &GlobSet) -> Vec<PathBuf
         if target.is_file() {
             files.push(target.clone());
         } else {
-            // Use the `ignore` crate to automatically respect .gitignore,
-            // .ignore, and skip hidden files/directories (.git, etc.).
+            // Use the `ignore` crate's parallel walker for multi-threaded directory traversal.
             let walker = WalkBuilder::new(target)
                 .hidden(true) // skip hidden files/dirs like .git
                 .git_ignore(true) // respect .gitignore
                 .git_global(true) // respect global gitignore
                 .git_exclude(true) // respect .git/info/exclude
-                .build();
+                .build_parallel();
 
-            for entry in walker.into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    let path = entry.into_path();
-                    let rel = path.strip_prefix(target).unwrap_or(&path);
-                    if exclude_set.is_match(rel.to_string_lossy().as_ref()) {
-                        continue;
+            let collected: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+            walker.run(|| {
+                Box::new(|entry| {
+                    if let Ok(entry) = entry {
+                        if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                            let path = entry.into_path();
+                            let rel = path.strip_prefix(target).unwrap_or(&path);
+                            if !exclude_set.is_match(rel.to_string_lossy().as_ref()) {
+                                collected.lock().unwrap().push(path);
+                            }
+                        }
                     }
-                    files.push(path);
-                }
-            }
+                    ignore::WalkState::Continue
+                })
+            });
+
+            files.extend(collected.into_inner().unwrap());
         }
     }
     files
@@ -627,6 +738,11 @@ mod tests {
             source_line: None,
             fix: None,
         }
+    }
+
+    /// Count total rules across all groups.
+    fn total_rules(groups: &[RuleGroup]) -> usize {
+        groups.iter().map(|g| g.rules.len()).sum()
     }
 
     #[test]
@@ -720,7 +836,12 @@ mod tests {
         let lines = vec![
             "let x = style={{ color: 'red' }}; // guardrails:allow-no-inline-styles",
         ];
-        assert!(is_suppressed(&lines, 1, "no-inline-styles"));
+        assert!(is_suppressed(
+            &lines,
+            1,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
     }
 
     #[test]
@@ -728,8 +849,18 @@ mod tests {
         let lines = vec![
             "let x = style={{ color: 'red' }}; // guardrails:allow-all",
         ];
-        assert!(is_suppressed(&lines, 1, "no-inline-styles"));
-        assert!(is_suppressed(&lines, 1, "any-other-rule"));
+        assert!(is_suppressed(
+            &lines,
+            1,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
+        assert!(is_suppressed(
+            &lines,
+            1,
+            "guardrails:allow-any-other-rule",
+            "guardrails:allow-next-line any-other-rule",
+        ));
     }
 
     #[test]
@@ -738,7 +869,12 @@ mod tests {
             "// guardrails:allow-next-line no-inline-styles",
             "let x = style={{ color: 'red' }};",
         ];
-        assert!(is_suppressed(&lines, 2, "no-inline-styles"));
+        assert!(is_suppressed(
+            &lines,
+            2,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
     }
 
     #[test]
@@ -747,7 +883,12 @@ mod tests {
             "// guardrails:allow-next-line all",
             "let x = style={{ color: 'red' }};",
         ];
-        assert!(is_suppressed(&lines, 2, "no-inline-styles"));
+        assert!(is_suppressed(
+            &lines,
+            2,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
     }
 
     #[test]
@@ -755,7 +896,12 @@ mod tests {
         let lines = vec![
             "let x = style={{ color: 'red' }}; // guardrails:allow-other-rule",
         ];
-        assert!(!is_suppressed(&lines, 1, "no-inline-styles"));
+        assert!(!is_suppressed(
+            &lines,
+            1,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
     }
 
     #[test]
@@ -763,7 +909,12 @@ mod tests {
         let lines = vec![
             "let x = style={{ color: 'red' }};",
         ];
-        assert!(!is_suppressed(&lines, 1, "no-inline-styles"));
+        assert!(!is_suppressed(
+            &lines,
+            1,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
     }
 
     #[test]
@@ -772,21 +923,36 @@ mod tests {
             "// guardrails:allow-next-line other-rule",
             "let x = style={{ color: 'red' }};",
         ];
-        assert!(!is_suppressed(&lines, 2, "no-inline-styles"));
+        assert!(!is_suppressed(
+            &lines,
+            2,
+            "guardrails:allow-no-inline-styles",
+            "guardrails:allow-next-line no-inline-styles",
+        ));
     }
 
     #[test]
     fn suppressed_line_zero_is_safe() {
         let lines = vec!["some content"];
         // line_num 0 should not panic
-        assert!(!is_suppressed(&lines, 0, "any-rule"));
+        assert!(!is_suppressed(
+            &lines,
+            0,
+            "guardrails:allow-any-rule",
+            "guardrails:allow-next-line any-rule",
+        ));
     }
 
     #[test]
     fn suppressed_past_end_is_safe() {
         let lines = vec!["some content"];
         // line_num past end should not panic
-        assert!(!is_suppressed(&lines, 5, "any-rule"));
+        assert!(!is_suppressed(
+            &lines,
+            5,
+            "guardrails:allow-any-rule",
+            "guardrails:allow-next-line any-rule",
+        ));
     }
 
     // ── ScanError Display tests ──
@@ -849,7 +1015,7 @@ mod tests {
         }];
 
         let built = build_rules(&rules).unwrap();
-        assert_eq!(built.rules.len(), 1);
+        assert_eq!(total_rules(&built.rule_groups), 1);
         assert!(built.ratchet_thresholds.is_empty());
         assert!(built.file_presence_rules.is_empty());
     }
@@ -867,7 +1033,7 @@ mod tests {
         }];
 
         let built = build_rules(&rules).unwrap();
-        assert_eq!(built.rules.len(), 1);
+        assert_eq!(total_rules(&built.rule_groups), 1);
         assert_eq!(built.ratchet_thresholds["legacy-api"], 10);
     }
 
@@ -891,7 +1057,7 @@ mod tests {
         ];
 
         let built = build_rules(&rules).unwrap();
-        assert_eq!(built.rules.len(), 1); // only banned-pattern
+        assert_eq!(total_rules(&built.rule_groups), 1); // only banned-pattern
         assert_eq!(built.file_presence_rules.len(), 1);
     }
 
@@ -922,8 +1088,8 @@ mod tests {
         }];
 
         let built = build_rules(&rules).unwrap();
-        assert_eq!(built.rules.len(), 1);
-        assert!(built.rules[0].exclusion_glob.is_some());
+        assert_eq!(built.rule_groups.len(), 1);
+        assert!(built.rule_groups[0].exclusion_glob.is_some());
     }
 
     #[test]
@@ -939,15 +1105,15 @@ mod tests {
         }];
 
         let built = build_rules(&rules).unwrap();
-        assert_eq!(built.rules.len(), 1);
-        assert!(built.rules[0].file_contains.is_some());
-        assert!(built.rules[0].file_not_contains.is_some());
+        assert_eq!(built.rule_groups.len(), 1);
+        assert!(built.rule_groups[0].rules[0].file_contains.is_some());
+        assert!(built.rule_groups[0].rules[0].file_not_contains.is_some());
     }
 
-    // ── rule_matches_file tests ──
+    // ── group_matches_file tests ──
 
     #[test]
-    fn rule_matches_file_no_glob_matches_all() {
+    fn group_matches_file_no_glob_matches_all() {
         let rules = vec![TomlRule {
             id: "r".into(),
             rule_type: "banned-pattern".into(),
@@ -956,11 +1122,11 @@ mod tests {
             ..Default::default()
         }];
         let built = build_rules(&rules).unwrap();
-        assert!(rule_matches_file(&built.rules[0], "anything.rs", "anything.rs"));
+        assert!(group_matches_file(&built.rule_groups[0], "anything.rs", "anything.rs"));
     }
 
     #[test]
-    fn rule_matches_file_inclusion_glob_filters() {
+    fn group_matches_file_inclusion_glob_filters() {
         let rules = vec![TomlRule {
             id: "r".into(),
             rule_type: "banned-pattern".into(),
@@ -970,12 +1136,12 @@ mod tests {
             ..Default::default()
         }];
         let built = build_rules(&rules).unwrap();
-        assert!(rule_matches_file(&built.rules[0], "src/Foo.tsx", "Foo.tsx"));
-        assert!(!rule_matches_file(&built.rules[0], "src/Foo.rs", "Foo.rs"));
+        assert!(group_matches_file(&built.rule_groups[0], "src/Foo.tsx", "Foo.tsx"));
+        assert!(!group_matches_file(&built.rule_groups[0], "src/Foo.rs", "Foo.rs"));
     }
 
     #[test]
-    fn rule_matches_file_exclusion_glob_rejects() {
+    fn group_matches_file_exclusion_glob_rejects() {
         let rules = vec![TomlRule {
             id: "r".into(),
             rule_type: "banned-pattern".into(),
@@ -985,8 +1151,8 @@ mod tests {
             ..Default::default()
         }];
         let built = build_rules(&rules).unwrap();
-        assert!(rule_matches_file(&built.rules[0], "src/app.ts", "app.ts"));
-        assert!(!rule_matches_file(&built.rules[0], "src/test/app.ts", "app.ts"));
+        assert!(group_matches_file(&built.rule_groups[0], "src/app.ts", "app.ts"));
+        assert!(!group_matches_file(&built.rule_groups[0], "src/test/app.ts", "app.ts"));
     }
 
     // ── passes_file_conditioning tests ──
@@ -1001,7 +1167,8 @@ mod tests {
             ..Default::default()
         }];
         let built = build_rules(&rules).unwrap();
-        assert!(passes_file_conditioning(&built.rules[0], "anything"));
+        let mut cache = HashMap::new();
+        assert!(passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "anything", &mut cache));
     }
 
     #[test]
@@ -1015,8 +1182,10 @@ mod tests {
             ..Default::default()
         }];
         let built = build_rules(&rules).unwrap();
-        assert!(passes_file_conditioning(&built.rules[0], "import React from 'react';"));
-        assert!(!passes_file_conditioning(&built.rules[0], "import Vue from 'vue';"));
+        let mut cache = HashMap::new();
+        assert!(passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "import React from 'react';", &mut cache));
+        let mut cache = HashMap::new();
+        assert!(!passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "import Vue from 'vue';", &mut cache));
     }
 
     #[test]
@@ -1030,8 +1199,10 @@ mod tests {
             ..Default::default()
         }];
         let built = build_rules(&rules).unwrap();
-        assert!(passes_file_conditioning(&built.rules[0], "normal code"));
-        assert!(!passes_file_conditioning(&built.rules[0], "// @generated\nnormal code"));
+        let mut cache = HashMap::new();
+        assert!(passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "normal code", &mut cache));
+        let mut cache = HashMap::new();
+        assert!(!passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "// @generated\nnormal code", &mut cache));
     }
 
     #[test]
@@ -1047,11 +1218,14 @@ mod tests {
         }];
         let built = build_rules(&rules).unwrap();
         // Has required, missing excluded -> pass
-        assert!(passes_file_conditioning(&built.rules[0], "import React"));
+        let mut cache = HashMap::new();
+        assert!(passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "import React", &mut cache));
         // Missing required -> fail
-        assert!(!passes_file_conditioning(&built.rules[0], "import Vue"));
+        let mut cache = HashMap::new();
+        assert!(!passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "import Vue", &mut cache));
         // Has both -> fail (file_not_contains blocks it)
-        assert!(!passes_file_conditioning(&built.rules[0], "import React // @generated"));
+        let mut cache = HashMap::new();
+        assert!(!passes_file_conditioning_cached(&built.rule_groups[0].rules[0], "import React // @generated", &mut cache));
     }
 
     // ── run_rules_on_content tests ──
@@ -1070,7 +1244,7 @@ mod tests {
         let path = PathBuf::from("test.ts");
         let content = "console.log('hello');\nfoo();\n";
 
-        let violations = run_rules_on_content(&built.rules, &path, content, "test.ts", "test.ts");
+        let violations = run_rules_on_content(&built.rule_groups, &path, content, "test.ts", "test.ts");
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule_id, "no-console");
     }
@@ -1089,7 +1263,7 @@ mod tests {
         let path = PathBuf::from("test.ts");
         let content = "console.log('hello'); // guardrails:allow-no-console\n";
 
-        let violations = run_rules_on_content(&built.rules, &path, content, "test.ts", "test.ts");
+        let violations = run_rules_on_content(&built.rule_groups, &path, content, "test.ts", "test.ts");
         assert_eq!(violations.len(), 0);
     }
 
@@ -1108,7 +1282,7 @@ mod tests {
         let path = PathBuf::from("test.rs");
         let content = "console.log('hello');\n";
 
-        let violations = run_rules_on_content(&built.rules, &path, content, "test.rs", "test.rs");
+        let violations = run_rules_on_content(&built.rule_groups, &path, content, "test.rs", "test.rs");
         assert_eq!(violations.len(), 0);
     }
 
@@ -1127,7 +1301,7 @@ mod tests {
         let path = PathBuf::from("test.ts");
         let content = "console.log('hello');\n"; // no "import React"
 
-        let violations = run_rules_on_content(&built.rules, &path, content, "test.ts", "test.ts");
+        let violations = run_rules_on_content(&built.rule_groups, &path, content, "test.ts", "test.ts");
         assert_eq!(violations.len(), 0);
     }
 
@@ -1239,6 +1413,65 @@ mod tests {
         assert!(gs.is_match("/Users/dev/project/apps/web/src/components/Foo.tsx"));
         assert!(gs.is_match("apps/web/src/index.ts"));
         assert!(!gs.is_match("/Users/dev/project/apps/api/src/index.ts"));
+    }
+
+    // ── rule grouping tests ──
+
+    #[test]
+    fn build_rules_groups_same_glob() {
+        let rules = vec![
+            TomlRule {
+                id: "no-console".into(),
+                rule_type: "banned-pattern".into(),
+                pattern: Some("console\\.log".into()),
+                message: "no console".into(),
+                glob: Some("**/*.ts".into()),
+                regex: true,
+                ..Default::default()
+            },
+            TomlRule {
+                id: "no-debugger".into(),
+                rule_type: "banned-pattern".into(),
+                pattern: Some("debugger".into()),
+                message: "no debugger".into(),
+                glob: Some("**/*.ts".into()),
+                ..Default::default()
+            },
+        ];
+
+        let built = build_rules(&rules).unwrap();
+        // Both rules share the same glob, so they should be in one group
+        assert_eq!(built.rule_groups.len(), 1);
+        assert_eq!(built.rule_groups[0].rules.len(), 2);
+    }
+
+    #[test]
+    fn build_rules_separates_different_globs() {
+        let rules = vec![
+            TomlRule {
+                id: "no-console".into(),
+                rule_type: "banned-pattern".into(),
+                pattern: Some("console\\.log".into()),
+                message: "no console".into(),
+                glob: Some("**/*.ts".into()),
+                regex: true,
+                ..Default::default()
+            },
+            TomlRule {
+                id: "no-debugger".into(),
+                rule_type: "banned-pattern".into(),
+                pattern: Some("debugger".into()),
+                message: "no debugger".into(),
+                glob: Some("**/*.tsx".into()),
+                ..Default::default()
+            },
+        ];
+
+        let built = build_rules(&rules).unwrap();
+        // Different globs -> separate groups
+        assert_eq!(built.rule_groups.len(), 2);
+        assert_eq!(built.rule_groups[0].rules.len(), 1);
+        assert_eq!(built.rule_groups[1].rules.len(), 1);
     }
 
     // ── run_scan integration tests ──
