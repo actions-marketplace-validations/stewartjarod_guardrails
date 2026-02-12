@@ -35,6 +35,14 @@ pub enum Commands {
         #[arg(long, requires = "stdin")]
         filename: Option<String>,
 
+        /// Only scan files changed relative to a base branch (requires git)
+        #[arg(long, conflicts_with = "stdin")]
+        changed_only: bool,
+
+        /// Base ref for --changed-only (default: auto-detect from CI env or "main")
+        #[arg(long, requires = "changed_only")]
+        base: Option<String>,
+
         /// Apply fixes automatically
         #[arg(long)]
         fix: bool,

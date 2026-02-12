@@ -2,6 +2,7 @@ use clap::Parser;
 use guardrails::cli::format;
 use guardrails::cli::{Cli, Commands, OutputFormat};
 use guardrails::config::Severity;
+use guardrails::git_diff;
 use guardrails::init;
 use guardrails::mcp;
 use guardrails::scan;
@@ -19,6 +20,8 @@ fn main() {
             format: output_format,
             stdin,
             filename,
+            changed_only,
+            base,
             fix,
             dry_run,
         } => {
@@ -32,6 +35,34 @@ fn main() {
                 let fname = filename.as_deref().unwrap_or("stdin.tsx");
                 match scan::run_scan_stdin(&config, &content, fname) {
                     Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("\x1b[31merror\x1b[0m: {}", e);
+                        process::exit(2);
+                    }
+                }
+            } else if changed_only {
+                let base_ref = base.unwrap_or_else(|| git_diff::detect_base_ref());
+                match scan::run_scan_changed(&config, &paths, &base_ref) {
+                    Ok(r) => r,
+                    Err(scan::ScanError::GitDiff(ref msg)) => {
+                        eprintln!("\x1b[31merror\x1b[0m: {}", msg);
+                        eprintln!(
+                            "\x1b[90mhint\x1b[0m: --changed-only requires a git repository with the base branch available"
+                        );
+                        process::exit(2);
+                    }
+                    Err(scan::ScanError::ConfigRead(ref e))
+                        if e.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        eprintln!(
+                            "\x1b[31merror\x1b[0m: config file '{}' not found",
+                            config.display()
+                        );
+                        eprintln!(
+                            "\x1b[90mhint\x1b[0m: run \x1b[1mguardrails init\x1b[0m to generate a starter config"
+                        );
+                        process::exit(2);
+                    }
                     Err(e) => {
                         eprintln!("\x1b[31merror\x1b[0m: {}", e);
                         process::exit(2);

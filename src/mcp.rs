@@ -351,6 +351,8 @@ mod tests {
             files_scanned: 3,
             rules_loaded: 2,
             ratchet_counts: HashMap::new(),
+            changed_files_count: None,
+            base_ref: None,
         };
         let json = format_violations_json(&result);
         assert_eq!(json["summary"]["total"], 0);
@@ -378,6 +380,8 @@ mod tests {
             files_scanned: 1,
             rules_loaded: 1,
             ratchet_counts: HashMap::new(),
+            changed_files_count: None,
+            base_ref: None,
         };
         let json = format_violations_json(&result);
         assert_eq!(json["summary"]["total"], 1);
@@ -418,6 +422,8 @@ mod tests {
             files_scanned: 2,
             rules_loaded: 2,
             ratchet_counts: HashMap::new(),
+            changed_files_count: None,
+            base_ref: None,
         };
         let json = format_violations_json(&result);
         assert_eq!(json["summary"]["errors"], 1);

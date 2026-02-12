@@ -475,6 +475,8 @@ mod tests {
             files_scanned: 5,
             rules_loaded: 2,
             ratchet_counts: HashMap::new(),
+            changed_files_count: None,
+            base_ref: None,
         }
     }
 

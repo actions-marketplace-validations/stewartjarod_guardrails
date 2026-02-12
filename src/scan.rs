@@ -1,4 +1,5 @@
 use crate::cli::toml_config::{TomlConfig, TomlRule};
+use crate::git_diff;
 use crate::presets::{self, PresetError};
 use crate::rules::factory::{self, FactoryError};
 use crate::rules::file_presence::FilePresenceRule;
@@ -25,6 +26,7 @@ pub enum ScanError {
     GlobParse(globset::Error),
     RuleFactory(FactoryError),
     Preset(PresetError),
+    GitDiff(String),
 }
 
 impl fmt::Display for ScanError {
@@ -35,6 +37,7 @@ impl fmt::Display for ScanError {
             ScanError::GlobParse(e) => write!(f, "invalid glob pattern: {}", e),
             ScanError::RuleFactory(e) => write!(f, "failed to build rule: {}", e),
             ScanError::Preset(e) => write!(f, "preset error: {}", e),
+            ScanError::GitDiff(e) => write!(f, "git diff failed: {}", e),
         }
     }
 }
@@ -47,6 +50,10 @@ pub struct ScanResult {
     pub rules_loaded: usize,
     /// For each ratchet rule: (found_count, max_count).
     pub ratchet_counts: HashMap<String, (usize, usize)>,
+    /// Number of changed files when using --changed-only.
+    pub changed_files_count: Option<usize>,
+    /// Base ref used for diff when using --changed-only.
+    pub base_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,6 +290,8 @@ pub fn run_scan(config_path: &Path, target_paths: &[PathBuf]) -> Result<ScanResu
         files_scanned,
         rules_loaded,
         ratchet_counts,
+        changed_files_count: None,
+        base_ref: None,
     })
 }
 
@@ -356,7 +365,50 @@ pub fn run_scan_stdin(
         files_scanned: 1,
         rules_loaded,
         ratchet_counts,
+        changed_files_count: None,
+        base_ref: None,
     })
+}
+
+/// Run a scan filtered to only files/lines changed relative to a base branch.
+pub fn run_scan_changed(
+    config_path: &Path,
+    target_paths: &[PathBuf],
+    base_ref: &str,
+) -> Result<ScanResult, ScanError> {
+    // Get diff info from git
+    let diff = git_diff::diff_info(base_ref).map_err(|e| ScanError::GitDiff(e.to_string()))?;
+    let repo_root = git_diff::repo_root().map_err(|e| ScanError::GitDiff(e.to_string()))?;
+
+    let changed_files_count = diff.changed_lines.len();
+
+    // Run normal scan
+    let mut result = run_scan(config_path, target_paths)?;
+
+    // Post-filter violations to only those in changed files/lines
+    result.violations.retain(|v| {
+        // Compute relative path from repo root for matching against diff
+        let rel_path = if v.file.is_absolute() {
+            v.file.strip_prefix(&repo_root).unwrap_or(&v.file).to_path_buf()
+        } else {
+            v.file.clone()
+        };
+
+        if !diff.has_file(&rel_path) {
+            return false;
+        }
+
+        // File-level violations (no line number) pass if file is changed
+        match v.line {
+            Some(line) => diff.has_line(&rel_path, line),
+            None => true,
+        }
+    });
+
+    result.changed_files_count = Some(changed_files_count);
+    result.base_ref = Some(base_ref.to_string());
+
+    Ok(result)
 }
 
 /// Run baseline counting: parse config, build only ratchet rules, count matches.

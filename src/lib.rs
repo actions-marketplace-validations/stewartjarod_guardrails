@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod git_diff;
 pub mod init;
 pub mod mcp;
 pub mod presets;
