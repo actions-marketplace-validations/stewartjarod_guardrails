@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-const { spawnSync, execFileSync } = require("child_process");
-const { existsSync } = require("fs");
+const { spawnSync } = require("child_process");
+const { existsSync, chmodSync, statSync } = require("fs");
 const path = require("path");
 
 const PLATFORMS = {
@@ -41,6 +41,13 @@ function getBinaryPath() {
   const binaryPath = path.join(nodeModulesDir, pkg, binaryName);
 
   if (existsSync(binaryPath)) {
+    // Ensure the binary is executable (npm tarballs may not preserve permissions)
+    if (process.platform !== "win32") {
+      const mode = statSync(binaryPath).mode;
+      if (!(mode & 0o111)) {
+        chmodSync(binaryPath, mode | 0o755);
+      }
+    }
     return binaryPath;
   }
 
