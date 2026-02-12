@@ -1,5 +1,6 @@
 use crate::config::{RuleConfig, Severity};
 use crate::rules::{Rule, RuleBuildError, ScanContext, Violation};
+use regex::Regex;
 
 /// A ratchet rule that counts literal pattern occurrences across all files.
 ///
@@ -15,6 +16,7 @@ pub struct RatchetRule {
     glob: Option<String>,
     pattern: String,
     max_count: usize,
+    compiled_regex: Option<Regex>,
 }
 
 impl RatchetRule {
@@ -30,6 +32,14 @@ impl RatchetRule {
             .max_count
             .ok_or_else(|| RuleBuildError::MissingField(config.id.clone(), "max_count"))?;
 
+        let compiled_regex = if config.regex {
+            let re = Regex::new(&pattern)
+                .map_err(|e| RuleBuildError::InvalidRegex(config.id.clone(), e))?;
+            Some(re)
+        } else {
+            None
+        };
+
         Ok(Self {
             id: config.id.clone(),
             severity: config.severity,
@@ -38,6 +48,7 @@ impl RatchetRule {
             glob: config.glob.clone(),
             pattern,
             max_count,
+            compiled_regex,
         })
     }
 
@@ -65,24 +76,43 @@ impl Rule for RatchetRule {
 
     fn check_file(&self, ctx: &ScanContext) -> Vec<Violation> {
         let mut violations = Vec::new();
-        let pattern = self.pattern.as_str();
-        let pattern_len = pattern.len();
 
         for (line_idx, line) in ctx.content.lines().enumerate() {
-            let mut search_start = 0;
-            while let Some(pos) = line[search_start..].find(pattern) {
-                let col = search_start + pos;
-                violations.push(Violation {
-                    rule_id: self.id.clone(),
-                    severity: self.severity,
-                    file: ctx.file_path.to_path_buf(),
-                    line: Some(line_idx + 1),
-                    column: Some(col + 1),
-                    message: self.message.clone(),
-                    suggest: self.suggest.clone(),
-                    source_line: Some(line.to_string()),
-                });
-                search_start = col + pattern_len;
+            if let Some(ref re) = self.compiled_regex {
+                // Regex mode
+                for m in re.find_iter(line) {
+                    violations.push(Violation {
+                        rule_id: self.id.clone(),
+                        severity: self.severity,
+                        file: ctx.file_path.to_path_buf(),
+                        line: Some(line_idx + 1),
+                        column: Some(m.start() + 1),
+                        message: self.message.clone(),
+                        suggest: self.suggest.clone(),
+                        source_line: Some(line.to_string()),
+                        fix: None,
+                    });
+                }
+            } else {
+                // Literal mode
+                let pattern = self.pattern.as_str();
+                let pattern_len = pattern.len();
+                let mut search_start = 0;
+                while let Some(pos) = line[search_start..].find(pattern) {
+                    let col = search_start + pos;
+                    violations.push(Violation {
+                        rule_id: self.id.clone(),
+                        severity: self.severity,
+                        file: ctx.file_path.to_path_buf(),
+                        line: Some(line_idx + 1),
+                        column: Some(col + 1),
+                        message: self.message.clone(),
+                        suggest: self.suggest.clone(),
+                        source_line: Some(line.to_string()),
+                        fix: None,
+                    });
+                    search_start = col + pattern_len;
+                }
             }
         }
 
