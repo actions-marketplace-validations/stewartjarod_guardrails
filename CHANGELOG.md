@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.3.4] - 2026-02-12
+
+### Bug Fixes
+- remove bin field from platform packages to avoid npx symlink conflict (9fbb692)
+
 ## [v0.3.3] - 2026-02-12
 
 ### Bug Fixes
