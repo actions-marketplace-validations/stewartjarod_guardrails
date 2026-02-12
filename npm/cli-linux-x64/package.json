@@ -1,0 +1,19 @@
+{
+  "name": "code-guardrails-linux-x64",
+  "version": "0.2.0",
+  "description": "Guardrails CLI binary for Linux x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stewartjarod/guardrails"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "guardrails"
+  ]
+}

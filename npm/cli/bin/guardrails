@@ -1,0 +1,61 @@
+#!/usr/bin/env node
+
+const { spawnSync } = require("child_process");
+const path = require("path");
+
+const PLATFORMS = {
+  "darwin-arm64": "code-guardrails-darwin-arm64",
+  "darwin-x64": "code-guardrails-darwin-x64",
+  "linux-x64": "code-guardrails-linux-x64",
+  "linux-arm64": "code-guardrails-linux-arm64",
+  "win32-x64": "code-guardrails-win32-x64",
+};
+
+function getBinaryPath() {
+  // Allow override via environment variable
+  const override = process.env.GUARDRAILS_BINARY;
+  if (override) {
+    return override;
+  }
+
+  const platformKey = `${process.platform}-${process.arch}`;
+  const pkg = PLATFORMS[platformKey];
+
+  if (!pkg) {
+    console.error(
+      `Unsupported platform: ${platformKey}\n` +
+        `code-guardrails does not ship a prebuilt binary for your platform.\n\n` +
+        `You can install from source with:\n` +
+        `  cargo install guardrails\n`
+    );
+    process.exit(1);
+  }
+
+  const binaryName = process.platform === "win32" ? "guardrails.exe" : "guardrails";
+
+  try {
+    return require.resolve(path.join(pkg, binaryName));
+  } catch {
+    console.error(
+      `Could not find the binary for ${pkg}.\n` +
+        `This usually means the optional dependency was not installed.\n\n` +
+        `Try reinstalling:\n` +
+        `  npm install -g code-guardrails\n\n` +
+        `Or install from source:\n` +
+        `  cargo install guardrails\n`
+    );
+    process.exit(1);
+  }
+}
+
+const binary = getBinaryPath();
+const result = spawnSync(binary, process.argv.slice(2), {
+  stdio: "inherit",
+});
+
+if (result.error) {
+  console.error(`Failed to execute guardrails: ${result.error.message}`);
+  process.exit(1);
+}
+
+process.exit(result.status ?? 1);

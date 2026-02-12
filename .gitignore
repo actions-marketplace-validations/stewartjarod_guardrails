@@ -1,3 +1,6 @@
 /target
 .claude/
 !.claude/commands/
+npm/cli-*/guardrails
+npm/cli-*/guardrails.exe
+node_modules/

@@ -1,0 +1,29 @@
+{
+  "name": "code-guardrails",
+  "version": "0.2.0",
+  "description": "Enforce architectural decisions AI coding tools keep ignoring",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stewartjarod/guardrails"
+  },
+  "bin": {
+    "guardrails": "bin/guardrails"
+  },
+  "files": [
+    "bin/guardrails"
+  ],
+  "optionalDependencies": {
+    "code-guardrails-darwin-arm64": "0.2.0",
+    "code-guardrails-darwin-x64": "0.2.0",
+    "code-guardrails-linux-x64": "0.2.0",
+    "code-guardrails-linux-arm64": "0.2.0",
+    "code-guardrails-win32-x64": "0.2.0"
+  },
+  "keywords": [
+    "linter",
+    "tailwind",
+    "react",
+    "code-quality"
+  ]
+}

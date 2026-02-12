@@ -58,16 +58,20 @@ If `CHANGELOG.md` exists, prepend the new section after any existing `# Changelo
 
 Edit the `version = "..."` line in `Cargo.toml` to the new version. Only change the version field in `[package]`.
 
+### Step 3b: Sync npm package versions
+
+Run `node npm/scripts/update-versions.mjs` to update all npm `package.json` files to match the new Cargo.toml version.
+
 ### Step 4: Run checks
 
 Run `cargo check` to verify the project still compiles after the version bump. If it fails, stop and report the error.
 
 ### Step 5: Commit and tag
 
-Stage `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`, then commit:
+Stage `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and the npm package files, then commit:
 
 ```
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock CHANGELOG.md npm/*/package.json
 git commit -m "chore: release v{new_version}"
 ```
 
