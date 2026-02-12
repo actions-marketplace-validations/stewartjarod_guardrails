@@ -1,6 +1,6 @@
 {
   "name": "code-guardrails-win32-x64",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Guardrails CLI binary for Windows x64",
   "license": "MIT",
   "repository": {

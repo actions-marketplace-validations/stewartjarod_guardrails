@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.3.3] - 2026-02-12
+
+### Bug Fixes
+- use direct path resolution for platform binary in npx (12701c8)
+
 ## [v0.3.2] - 2026-02-12
 
 ### Bug Fixes
