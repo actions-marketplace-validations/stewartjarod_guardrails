@@ -589,6 +589,10 @@ message = "Migrate to newApi.request()"
 - **Watch mode** — re-run on file changes during development
 - **Monorepo support** — per-package config inheritance with shared base rules
 
+## Inspiration
+
+This project was inspired by Matt Holden's concept of [guardrail coding](https://www.fuzzycomputer.com/posts/guardrail-coding) — the idea that AI coding tools should be guided by deterministic environment constraints (linters, rules, tests) rather than fuzzy prompt-space instructions. Follow Matt at [@holdenmatt](https://x.com/holdenmatt).
+
 ## License
 
 MIT
