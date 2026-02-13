@@ -35,9 +35,17 @@ ESLint is great at what it does. guardrails handles what it can't:
 ## Quick Start
 
 ```bash
-# Build from source
-cargo build --release
+# Run instantly via npm (no install needed)
+npx code-guardrails scan
 
+# Or install globally
+npm install -g code-guardrails
+
+# Or via Cargo
+cargo install guardrails
+```
+
+```bash
 # Initialize a config in your project
 guardrails init
 
